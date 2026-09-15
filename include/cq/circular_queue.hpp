@@ -88,7 +88,7 @@ public:
     /**
      * @brief Destroy the queue.
      *
-     * Purpose: Release mutex / condition_variable resources.
+     * Purpose: Release mutex / per-reader condition_variable resources.
      * Behavior: Undefined to destroy while other threads still call members.
      */
     ~CircularQueue() = default;
@@ -99,7 +99,8 @@ public:
      * Purpose: Publish one item to all registered readers.
      * Behavior: Under the mutex, stamps Clock::now(), computes CRC via
      * CrcTraits, stores at writeSequence % Capacity, increments writeSequence,
-     * then notify_all. Always succeeds in O(1); never blocks on a full queue.
+     * then notify_one on each active reader whose cursor is behind. Always
+     * succeeds in O(1); never blocks on a full queue.
      * @param item Value to store (copied into the slot).
      * @return void
      */
@@ -121,8 +122,9 @@ public:
      * @brief Release a previously registered reader slot.
      *
      * Purpose: Free a MaxReaders table entry for later reuse.
-     * Behavior: Marks the slot inactive and clears its cursor. Safe no-op when
-     * @p id is out of range or already inactive.
+     * Behavior: Marks the slot inactive, clears its cursor, and wakes that
+     * reader's waiters (if any). Safe no-op when @p id is out of range or
+     * already inactive.
      * @param id Handle previously returned by registerReader.
      * @return void
      */
@@ -145,10 +147,12 @@ public:
     /**
      * @brief Blocking read that waits up to a timeout for a new item.
      *
-     * Purpose: Avoid polling; sleep until write notifies or the timeout elapses.
-     * Behavior: wait_for on the predicate nextSequence < writeSequence under the
-     * same mutex as write (no lost notifications). On wakeup with work, behaves
-     * like tryRead. On timeout with no work, returns Empty.
+     * Purpose: Avoid polling; sleep until this reader's CV is notified or the
+     * timeout elapses.
+     * Behavior: wait_for on that reader's condition_variable with predicate
+     * nextSequence < writeSequence (same mutex as write; no lost wakeups). On
+     * wakeup with work, behaves like tryRead. On timeout with no work, returns
+     * Empty.
      * @param id      Reader handle from registerReader.
      * @param timeout Maximum time to wait for at least one new item.
      * @return ReadResult: InvalidReader if @p id is bad; Empty on timeout with
@@ -213,6 +217,7 @@ private:
     {
         bool active{false};
         std::uint64_t nextSequence{0U};
+        std::condition_variable itemAdded{};
     };
 
     Result readLocked(ReaderId id) noexcept;
@@ -222,8 +227,6 @@ private:
     std::uint64_t writeSequence_{0U};
     std::chrono::milliseconds expiration_;
     mutable std::mutex mutex_;
-    // ponytail: one shared cv wakes all readers; per-reader events if fan-out costs matter
-    std::condition_variable itemAdded_;
 };
 
 } // namespace cq

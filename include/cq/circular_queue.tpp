@@ -16,6 +16,9 @@ CircularQueue<T, Capacity, MaxReaders, Clock>::CircularQueue
 template <typename T, std::size_t Capacity, std::size_t MaxReaders, typename Clock>
 void CircularQueue<T, Capacity, MaxReaders, Clock>::write(const T& item) noexcept
 {
+    std::array<std::size_t, MaxReaders> notifyIds{};
+    std::size_t notifyCount = 0U;
+
     {
         std::lock_guard<std::mutex> lock(mutex_);
         const std::size_t index = static_cast<std::size_t>(writeSequence_ % Capacity);
@@ -25,8 +28,22 @@ void CircularQueue<T, Capacity, MaxReaders, Clock>::write(const T& item) noexcep
         slot.crc = computeCrc(item);
         slot.sequence = writeSequence_;
         ++writeSequence_;
+
+        // Wake only readers that can observe the new sequence.
+        for (std::size_t i = 0U; i < MaxReaders; ++i)
+        {
+            if (readers_[i].active && readers_[i].nextSequence < writeSequence_)
+            {
+                notifyIds[notifyCount] = i;
+                ++notifyCount;
+            }
+        }
     }
-    itemAdded_.notify_all();
+
+    for (std::size_t i = 0U; i < notifyCount; ++i)
+    {
+        readers_[notifyIds[i]].itemAdded.notify_one();
+    }
 }
 
 template <typename T, std::size_t Capacity, std::size_t MaxReaders, typename Clock>
@@ -49,12 +66,22 @@ std::optional<ReaderId> CircularQueue<T, Capacity, MaxReaders, Clock>::registerR
 template <typename T, std::size_t Capacity, std::size_t MaxReaders, typename Clock>
 void CircularQueue<T, Capacity, MaxReaders, Clock>::unregisterReader(ReaderId id) noexcept
 {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (id.value < MaxReaders)
+    if (id.value >= MaxReaders)
     {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!readers_[id.value].active)
+        {
+            return;
+        }
         readers_[id.value].active = false;
         readers_[id.value].nextSequence = 0U;
     }
+    // Unblock a waiter on this id so it can observe InvalidReader.
+    readers_[id.value].itemAdded.notify_one();
 }
 
 template <typename T, std::size_t Capacity, std::size_t MaxReaders, typename Clock>
@@ -141,9 +168,18 @@ CircularQueue<T, Capacity, MaxReaders, Clock>::read
         return result;
     }
 
-    const bool ready = itemAdded_.wait_for(lock, timeout, [this, id]() {
-        return readers_[id.value].nextSequence < writeSequence_;
+    ReaderState& reader = readers_[id.value];
+    const bool ready = reader.itemAdded.wait_for(lock, timeout, [this, id]() {
+        return !readers_[id.value].active
+            || readers_[id.value].nextSequence < writeSequence_;
     });
+
+    if (!readers_[id.value].active)
+    {
+        Result result{};
+        result.status = ReadStatus::InvalidReader;
+        return result;
+    }
 
     if (!ready)
     {
